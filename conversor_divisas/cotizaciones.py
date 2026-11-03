@@ -1,9 +1,10 @@
 """Módulo encargado de consultar la API de cotizaciones y hacer cálculos."""
 
+from datetime import datetime
+
 import requests
 
 URL_API: str = "https://dolarapi.com/v1/dolares"
-CASAS_BUSCADAS: tuple[str, ...] = ("oficial", "blue")
 TIEMPO_ESPERA: int = 10
 
 
@@ -12,7 +13,7 @@ class ErrorCotizacion(Exception):
 
 
 def obtener_cotizaciones(url: str = URL_API) -> list[dict]:
-    """Consulta la API y devuelve la lista de cotizaciones.
+    """Consulta la API y devuelve la lista de cotizaciones sin procesar.
 
     Args:
         url: Dirección de la API a consultar.
@@ -54,37 +55,80 @@ def obtener_cotizaciones(url: str = URL_API) -> list[dict]:
     return datos
 
 
-def filtrar_cotizaciones(
-    cotizaciones: list[dict],
-    casas: tuple[str, ...] = CASAS_BUSCADAS,
-) -> list[dict]:
-    """Se queda solo con las cotizaciones de las casas pedidas.
+def convertir_precio(valor: object) -> float | None:
+    """Convierte un precio de la API a número.
 
     Args:
-        cotizaciones: Lista completa devuelta por la API.
-        casas: Nombres de las casas a conservar (ej: "oficial", "blue").
+        valor: Precio tal como viene en la API (número, texto o None).
 
     Returns:
-        Lista con las cotizaciones encontradas, en el orden de ``casas``.
+        El precio como float, o None si no existe o no es un número
+        positivo.
+    """
+    try:
+        precio = float(valor)
+    except (TypeError, ValueError):
+        return None
+    return precio if precio > 0 else None
+
+
+def convertir_fecha(texto: object) -> datetime | None:
+    """Convierte la fecha ISO de la API a la hora local de la máquina.
+
+    Args:
+        texto: Fecha en formato ISO 8601 (ej: "2026-11-03T18:00:00.000Z").
+
+    Returns:
+        La fecha en hora local, o None si no se puede interpretar.
+    """
+    if not isinstance(texto, str):
+        return None
+    try:
+        fecha = datetime.fromisoformat(texto.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return fecha.astimezone()
+
+
+def normalizar_cotizaciones(cotizaciones: list[dict]) -> list[dict]:
+    """Limpia los datos de la API y deja solo las cotizaciones válidas.
+
+    Una cotización es válida si tiene nombre y precio de venta. El precio
+    de compra y la fecha pueden faltar (quedan en None).
+
+    Args:
+        cotizaciones: Lista cruda devuelta por la API.
+
+    Returns:
+        Lista de diccionarios con las claves nombre, compra, venta y fecha.
 
     Raises:
-        ErrorCotizacion: Si falta alguna de las casas buscadas.
+        ErrorCotizacion: Si no queda ninguna cotización válida.
     """
-    por_casa = {
-        cotizacion.get("casa"): cotizacion
-        for cotizacion in cotizaciones
-        if isinstance(cotizacion, dict)
-    }
-    faltantes = [casa for casa in casas if casa not in por_casa]
-    if faltantes:
-        raise ErrorCotizacion(
-            f"No se encontraron cotizaciones para: {', '.join(faltantes)}"
-        )
-    return [por_casa[casa] for casa in casas]
+    normalizadas = []
+    for cotizacion in cotizaciones:
+        if not isinstance(cotizacion, dict):
+            continue
+        nombre = cotizacion.get("nombre")
+        venta = convertir_precio(cotizacion.get("venta"))
+        if not nombre or venta is None:
+            continue
+        normalizadas.append({
+            "nombre": str(nombre),
+            "compra": convertir_precio(cotizacion.get("compra")),
+            "venta": venta,
+            "fecha": convertir_fecha(cotizacion.get("fechaActualizacion")),
+        })
+
+    if not normalizadas:
+        raise ErrorCotizacion("La API no devolvió cotizaciones válidas.")
+    return normalizadas
 
 
-def convertir(monto_ars: float, venta: float) -> float:
-    """Convierte un monto en pesos a dólares usando el precio de venta.
+def pesos_a_dolares(monto_ars: float, venta: float) -> float:
+    """Convierte pesos a dólares usando el precio de venta.
+
+    Se usa la venta porque es el precio al que se compran dólares con pesos.
 
     Args:
         monto_ars: Monto en pesos argentinos.
@@ -92,48 +136,49 @@ def convertir(monto_ars: float, venta: float) -> float:
 
     Returns:
         Monto equivalente en dólares.
-
-    Raises:
-        ErrorCotizacion: Si el precio de venta no es un número positivo.
     """
-    if venta <= 0:
-        raise ErrorCotizacion("El precio de venta debe ser mayor a cero.")
     return monto_ars / venta
 
 
-def armar_resultados(cotizaciones: list[dict], monto_ars: float) -> list[dict]:
-    """Calcula la conversión para cada cotización.
+def dolares_a_pesos(monto_usd: float, compra: float) -> float:
+    """Convierte dólares a pesos usando el precio de compra.
+
+    Se usa la compra porque es el precio que pagan por los dólares
+    cuando uno los vende.
 
     Args:
-        cotizaciones: Cotizaciones ya filtradas.
-        monto_ars: Monto en pesos a convertir.
+        monto_usd: Monto en dólares.
+        compra: Precio de compra del dólar en pesos.
 
     Returns:
-        Lista de diccionarios con nombre, compra, venta y total en USD.
+        Monto equivalente en pesos argentinos.
+    """
+    return monto_usd * compra
 
-    Raises:
-        ErrorCotizacion: Si a alguna cotización le faltan datos o no son
-            numéricos.
+
+def calcular_conversiones(
+    cotizaciones: list[dict],
+    monto: float,
+    a_dolares: bool,
+) -> list[dict]:
+    """Agrega a cada cotización el total convertido.
+
+    Args:
+        cotizaciones: Cotizaciones ya normalizadas.
+        monto: Monto a convertir (en ARS o en USD según ``a_dolares``).
+        a_dolares: True para convertir ARS → USD, False para USD → ARS.
+
+    Returns:
+        Copia de las cotizaciones con la clave extra "total". Vale None si
+        falta el precio necesario para esa conversión.
     """
     resultados = []
     for cotizacion in cotizaciones:
-        try:
-            nombre = str(cotizacion["nombre"])
-            compra = float(cotizacion["compra"])
-            venta = float(cotizacion["venta"])
-        except KeyError as error:
-            raise ErrorCotizacion(
-                f"A la cotización le falta el dato {error}."
-            ) from error
-        except (TypeError, ValueError) as error:
-            raise ErrorCotizacion(
-                "La cotización tiene valores que no son numéricos."
-            ) from error
-
-        resultados.append({
-            "nombre": nombre,
-            "compra": compra,
-            "venta": venta,
-            "total_usd": convertir(monto_ars, venta),
-        })
+        if a_dolares:
+            total = pesos_a_dolares(monto, cotizacion["venta"])
+        elif cotizacion["compra"] is not None:
+            total = dolares_a_pesos(monto, cotizacion["compra"])
+        else:
+            total = None
+        resultados.append({**cotizacion, "total": total})
     return resultados
