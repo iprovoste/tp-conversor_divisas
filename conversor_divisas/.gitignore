@@ -8,3 +8,7 @@ __pycache__/
 # Editores
 .vscode/
 .idea/
+
+# Archivos generados por el programa
+historial.csv
+historial.txt

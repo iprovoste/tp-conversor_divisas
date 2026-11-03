@@ -5,10 +5,21 @@ from datetime import datetime
 from tabulate import tabulate
 
 OPCIONES_MENU: dict[str, str] = {
-    "1": "Convertir pesos (ARS) a dólares (USD)",
-    "2": "Convertir dólares (USD) a pesos (ARS)",
-    "3": "Actualizar cotizaciones",
+    "1": "Pesos (ARS) → dólares (todos los tipos)",
+    "2": "Dólares → pesos (ARS) (todos los tipos)",
+    "3": "Pesos (ARS) → otras monedas",
+    "4": "Otra moneda → pesos (ARS)",
+    "5": "Ver historial de conversiones",
+    "6": "Actualizar cotizaciones",
     "0": "Salir",
+}
+SIMBOLOS: dict[str, str] = {
+    "ARS": "$",
+    "USD": "US$",
+    "EUR": "€",
+    "BRL": "R$",
+    "CLP": "CLP$",
+    "UYU": "$U",
 }
 
 
@@ -54,6 +65,27 @@ def pedir_monto(moneda: str) -> float:
         return monto
 
 
+def pedir_moneda(monedas: list[dict]) -> str:
+    """Muestra las monedas disponibles y pide un código válido.
+
+    Args:
+        monedas: Cotizaciones normalizadas de las monedas.
+
+    Returns:
+        Código ISO de la moneda elegida, en mayúsculas (ej: "EUR").
+    """
+    codigos = [moneda["moneda"] for moneda in monedas]
+    print("\nMonedas disponibles:")
+    for moneda in monedas:
+        print(f"  {moneda['moneda']} → {moneda['nombre']}")
+
+    while True:
+        codigo = input("Código de la moneda: ").strip().upper()
+        if codigo in codigos:
+            return codigo
+        print(f"⚠️  Código inválido. Opciones: {', '.join(codigos)}.")
+
+
 def formatear_numero(valor: float) -> str:
     """Formatea un número al estilo argentino (ej: 1.234,56).
 
@@ -67,28 +99,34 @@ def formatear_numero(valor: float) -> str:
     return texto.replace(",", "X").replace(".", ",").replace("X", ".")
 
 
-def formatear_pesos(valor: float | None) -> str:
-    """Formatea un número como pesos (ej: $ 1.234,56).
+def formatear_moneda(valor: float | None, codigo: str) -> str:
+    """Formatea un número con el símbolo de su moneda (ej: € 1.234,56).
 
     Args:
         valor: Número a formatear, o None si no hay dato.
+        codigo: Código ISO de la moneda (ej: "EUR").
 
     Returns:
         Texto con el formato de moneda, o "-" si no hay dato.
     """
-    return "-" if valor is None else f"$ {formatear_numero(valor)}"
+    if valor is None:
+        return "-"
+    return f"{SIMBOLOS.get(codigo, codigo)} {formatear_numero(valor)}"
 
 
-def formatear_dolares(valor: float | None) -> str:
-    """Formatea un número como dólares (ej: US$ 1.234,56).
+def formatear_porcentaje(valor: float | None) -> str:
+    """Formatea un porcentaje con signo (ej: +6,30 %).
 
     Args:
-        valor: Número a formatear, o None si no hay dato.
+        valor: Porcentaje a formatear, o None si no hay dato.
 
     Returns:
-        Texto con el formato de moneda, o "-" si no hay dato.
+        Texto con signo y símbolo de porcentaje, o "-" si no hay dato.
     """
-    return "-" if valor is None else f"US$ {formatear_numero(valor)}"
+    if valor is None:
+        return "-"
+    signo = "+" if valor >= 0 else "-"
+    return f"{signo}{formatear_numero(abs(valor))} %"
 
 
 def formatear_fecha(fecha: datetime | None) -> str:
@@ -103,37 +141,96 @@ def formatear_fecha(fecha: datetime | None) -> str:
     return "-" if fecha is None else fecha.strftime("%d/%m %H:%M")
 
 
-def mostrar_tabla(resultados: list[dict], monto: float,
-                  a_dolares: bool) -> None:
-    """Imprime los resultados de la conversión en una tabla.
+def mostrar_tabla(
+    resultados: list[dict],
+    titulo: str,
+    desde_pesos: bool,
+    mostrar_brecha: bool = False,
+) -> None:
+    """Imprime los resultados de una conversión en una tabla.
 
     Args:
         resultados: Cotizaciones con la clave "total" ya calculada.
-        monto: Monto original ingresado por el usuario.
-        a_dolares: True si se convirtió ARS → USD, False si USD → ARS.
+        titulo: Texto a mostrar arriba de la tabla.
+        desde_pesos: True si se convirtió ARS → moneda (el total va en la
+            moneda de cada fila), False si moneda → ARS (total en pesos).
+        mostrar_brecha: True para agregar la columna de brecha contra el
+            dólar oficial.
     """
-    if a_dolares:
-        titulo = f"{formatear_pesos(monto)} en dólares (precio de venta)"
-        formatear_total = formatear_dolares
-    else:
-        titulo = f"{formatear_dolares(monto)} en pesos (precio de compra)"
-        formatear_total = formatear_pesos
+    encabezados = ["Cotización", "Compra", "Venta"]
+    alineacion = ["left", "right", "right"]
+    if mostrar_brecha:
+        encabezados.append("Brecha")
+        alineacion.append("right")
+    encabezados += ["Total", "Actualizado"]
+    alineacion += ["right", "center"]
 
-    filas = [
-        [
+    filas = []
+    for fila in resultados:
+        moneda_total = fila["moneda"] if desde_pesos else "ARS"
+        datos = [
             fila["nombre"],
-            formatear_pesos(fila["compra"]),
-            formatear_pesos(fila["venta"]),
-            formatear_total(fila["total"]),
+            formatear_moneda(fila["compra"], "ARS"),
+            formatear_moneda(fila["venta"], "ARS"),
+        ]
+        if mostrar_brecha:
+            datos.append(formatear_porcentaje(fila.get("brecha")))
+        datos += [
+            formatear_moneda(fila["total"], moneda_total),
             formatear_fecha(fila["fecha"]),
         ]
-        for fila in resultados
-    ]
-    encabezados = ["Dólar", "Compra", "Venta", "Total", "Actualizado"]
+        filas.append(datos)
 
     print(f"\n{titulo}:\n")
     print(tabulate(filas, headers=encabezados, tablefmt="rounded_outline",
-                   colalign=("left", "right", "right", "right", "center")))
+                   colalign=alineacion))
+
+
+def formatear_valor_guardado(texto: str, codigo: str) -> str:
+    """Formatea un monto leído del historial (que viene como texto).
+
+    Args:
+        texto: Valor tal como está en el archivo.
+        codigo: Código ISO de la moneda del valor.
+
+    Returns:
+        El valor formateado, "-" si está vacío o el texto original si no
+        es un número.
+    """
+    if not texto:
+        return "-"
+    try:
+        return formatear_moneda(float(texto), codigo)
+    except ValueError:
+        return texto
+
+
+def mostrar_historial(registros: list[dict]) -> None:
+    """Imprime las últimas conversiones guardadas en una tabla.
+
+    Args:
+        registros: Filas leídas del historial CSV.
+    """
+    if not registros:
+        print("\nTodavía no hay conversiones en el historial.")
+        return
+
+    filas = [
+        [
+            registro.get("fecha", "-"),
+            formatear_valor_guardado(registro.get("monto", ""),
+                                     registro.get("origen", "")),
+            registro.get("cotizacion", "-"),
+            formatear_valor_guardado(registro.get("resultado", ""),
+                                     registro.get("destino", "")),
+        ]
+        for registro in registros
+    ]
+    encabezados = ["Fecha", "Monto", "Cotización", "Resultado"]
+
+    print(f"\nÚltimas {len(registros)} líneas del historial:\n")
+    print(tabulate(filas, headers=encabezados, tablefmt="rounded_outline",
+                   colalign=("left", "right", "left", "right")))
 
 
 def mostrar_mensaje(mensaje: str) -> None:
@@ -143,6 +240,15 @@ def mostrar_mensaje(mensaje: str) -> None:
         mensaje: Texto a mostrar.
     """
     print(f"\n✅ {mensaje}")
+
+
+def mostrar_advertencia(mensaje: str) -> None:
+    """Muestra una advertencia que no detiene el programa.
+
+    Args:
+        mensaje: Texto a mostrar.
+    """
+    print(f"\n⚠️  {mensaje}")
 
 
 def mostrar_error(mensaje: str) -> None:

@@ -4,22 +4,24 @@ from datetime import datetime
 
 import requests
 
-URL_API: str = "https://dolarapi.com/v1/dolares"
+URL_DOLARES: str = "https://dolarapi.com/v1/dolares"
+URL_MONEDAS: str = "https://dolarapi.com/v1/cotizaciones"
 TIEMPO_ESPERA: int = 10
+CASA_REFERENCIA: str = "oficial"
 
 
 class ErrorCotizacion(Exception):
     """Error propio para problemas al obtener o interpretar cotizaciones."""
 
 
-def obtener_cotizaciones(url: str = URL_API) -> list[dict]:
+def obtener_cotizaciones(url: str) -> list[dict]:
     """Consulta la API y devuelve la lista de cotizaciones sin procesar.
 
     Args:
         url: Dirección de la API a consultar.
 
     Returns:
-        Lista de diccionarios, uno por cada tipo de dólar.
+        Lista de diccionarios, uno por cada cotización.
 
     Raises:
         ErrorCotizacion: Si no hay conexión, la API falla o la respuesta
@@ -93,14 +95,15 @@ def convertir_fecha(texto: object) -> datetime | None:
 def normalizar_cotizaciones(cotizaciones: list[dict]) -> list[dict]:
     """Limpia los datos de la API y deja solo las cotizaciones válidas.
 
-    Una cotización es válida si tiene nombre y precio de venta. El precio
-    de compra y la fecha pueden faltar (quedan en None).
+    Una cotización es válida si tiene nombre, código de moneda y precio de
+    venta. El precio de compra y la fecha pueden faltar (quedan en None).
 
     Args:
         cotizaciones: Lista cruda devuelta por la API.
 
     Returns:
-        Lista de diccionarios con las claves nombre, compra, venta y fecha.
+        Lista de diccionarios con las claves moneda, casa, nombre, compra,
+        venta y fecha.
 
     Raises:
         ErrorCotizacion: Si no queda ninguna cotización válida.
@@ -110,10 +113,13 @@ def normalizar_cotizaciones(cotizaciones: list[dict]) -> list[dict]:
         if not isinstance(cotizacion, dict):
             continue
         nombre = cotizacion.get("nombre")
+        moneda = cotizacion.get("moneda")
         venta = convertir_precio(cotizacion.get("venta"))
-        if not nombre or venta is None:
+        if not nombre or not moneda or venta is None:
             continue
         normalizadas.append({
+            "moneda": str(moneda).upper(),
+            "casa": str(cotizacion.get("casa", "")),
             "nombre": str(nombre),
             "compra": convertir_precio(cotizacion.get("compra")),
             "venta": venta,
@@ -125,60 +131,136 @@ def normalizar_cotizaciones(cotizaciones: list[dict]) -> list[dict]:
     return normalizadas
 
 
-def pesos_a_dolares(monto_ars: float, venta: float) -> float:
-    """Convierte pesos a dólares usando el precio de venta.
+def cargar_todo() -> dict[str, list[dict]]:
+    """Descarga y normaliza las cotizaciones del dólar y de otras monedas.
 
-    Se usa la venta porque es el precio al que se compran dólares con pesos.
+    Returns:
+        Diccionario con las claves "dolares" y "monedas".
+
+    Raises:
+        ErrorCotizacion: Si alguna de las dos consultas falla.
+    """
+    dolares = normalizar_cotizaciones(obtener_cotizaciones(URL_DOLARES))
+    monedas = normalizar_cotizaciones(obtener_cotizaciones(URL_MONEDAS))
+    return {"dolares": agregar_brecha(dolares), "monedas": monedas}
+
+
+def calcular_brecha(venta: float, venta_referencia: float) -> float:
+    """Calcula la brecha porcentual entre dos precios.
+
+    Args:
+        venta: Precio de venta a comparar.
+        venta_referencia: Precio de venta de referencia (el oficial).
+
+    Returns:
+        Diferencia en porcentaje (ej: 6.3 significa un 6,3 % más caro).
+    """
+    return (venta / venta_referencia - 1) * 100
+
+
+def agregar_brecha(
+    cotizaciones: list[dict],
+    casa_referencia: str = CASA_REFERENCIA,
+) -> list[dict]:
+    """Agrega a cada cotización su brecha contra la casa de referencia.
+
+    Args:
+        cotizaciones: Cotizaciones normalizadas del dólar.
+        casa_referencia: Casa contra la que se compara (por defecto,
+            "oficial").
+
+    Returns:
+        Copia de las cotizaciones con la clave extra "brecha". Vale None
+        si no se encontró la casa de referencia.
+    """
+    referencia = next(
+        (c for c in cotizaciones if c["casa"] == casa_referencia), None
+    )
+    resultado = []
+    for cotizacion in cotizaciones:
+        brecha = None
+        if referencia is not None:
+            brecha = calcular_brecha(cotizacion["venta"], referencia["venta"])
+        resultado.append({**cotizacion, "brecha": brecha})
+    return resultado
+
+
+def pesos_a_moneda(monto_ars: float, venta: float) -> float:
+    """Convierte pesos a otra moneda usando el precio de venta.
+
+    Se usa la venta porque es el precio al que se compra la moneda con
+    pesos.
 
     Args:
         monto_ars: Monto en pesos argentinos.
-        venta: Precio de venta del dólar en pesos.
+        venta: Precio de venta de la moneda en pesos.
 
     Returns:
-        Monto equivalente en dólares.
+        Monto equivalente en la otra moneda.
     """
     return monto_ars / venta
 
 
-def dolares_a_pesos(monto_usd: float, compra: float) -> float:
-    """Convierte dólares a pesos usando el precio de compra.
+def moneda_a_pesos(monto: float, compra: float) -> float:
+    """Convierte otra moneda a pesos usando el precio de compra.
 
-    Se usa la compra porque es el precio que pagan por los dólares
-    cuando uno los vende.
+    Se usa la compra porque es el precio que pagan por la moneda cuando
+    uno la vende.
 
     Args:
-        monto_usd: Monto en dólares.
-        compra: Precio de compra del dólar en pesos.
+        monto: Monto en la otra moneda.
+        compra: Precio de compra de la moneda en pesos.
 
     Returns:
         Monto equivalente en pesos argentinos.
     """
-    return monto_usd * compra
+    return monto * compra
 
 
 def calcular_conversiones(
     cotizaciones: list[dict],
     monto: float,
-    a_dolares: bool,
+    desde_pesos: bool,
 ) -> list[dict]:
     """Agrega a cada cotización el total convertido.
 
     Args:
         cotizaciones: Cotizaciones ya normalizadas.
-        monto: Monto a convertir (en ARS o en USD según ``a_dolares``).
-        a_dolares: True para convertir ARS → USD, False para USD → ARS.
+        monto: Monto a convertir.
+        desde_pesos: True para ARS → moneda, False para moneda → ARS.
 
     Returns:
-        Copia de las cotizaciones con la clave extra "total". Vale None si
-        falta el precio necesario para esa conversión.
+        Copia de las cotizaciones con las claves extra "precio" (el precio
+        usado) y "total". Ambas valen None si falta el precio necesario.
     """
     resultados = []
     for cotizacion in cotizaciones:
-        if a_dolares:
-            total = pesos_a_dolares(monto, cotizacion["venta"])
-        elif cotizacion["compra"] is not None:
-            total = dolares_a_pesos(monto, cotizacion["compra"])
-        else:
+        precio = cotizacion["venta"] if desde_pesos else cotizacion["compra"]
+        if precio is None:
             total = None
-        resultados.append({**cotizacion, "total": total})
+        elif desde_pesos:
+            total = pesos_a_moneda(monto, precio)
+        else:
+            total = moneda_a_pesos(monto, precio)
+        resultados.append({**cotizacion, "precio": precio, "total": total})
     return resultados
+
+
+def buscar_moneda(monedas: list[dict], codigo: str) -> dict:
+    """Busca una moneda por su código (ej: "EUR").
+
+    Args:
+        monedas: Cotizaciones normalizadas de las monedas.
+        codigo: Código ISO de la moneda, en cualquier combinación de
+            mayúsculas y minúsculas.
+
+    Returns:
+        La cotización de esa moneda.
+
+    Raises:
+        ErrorCotizacion: Si la moneda no está en la lista.
+    """
+    for moneda in monedas:
+        if moneda["moneda"] == codigo.upper():
+            return moneda
+    raise ErrorCotizacion(f"No hay cotización para la moneda {codigo}.")
